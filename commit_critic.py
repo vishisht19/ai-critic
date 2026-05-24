@@ -24,6 +24,12 @@ from rich.panel import Panel
 from rich.rule import Rule
 
 try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    pass
+
+try:
     import anthropic as _anthropic
 except ImportError:
     _anthropic = None
@@ -1182,6 +1188,12 @@ def main(analyze, write, url, n, output, judge, run_eval, install_hooks, uninsta
         if hook or quiet:
             sys.exit(0)
         raise
+    finally:
+        try:
+            from langsmith import Client as _LSClient
+            _LSClient().flush()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
