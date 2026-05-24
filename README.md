@@ -12,10 +12,14 @@ Works with Anthropic (Claude), OpenAI (GPT), or a local Ollama model. No lock-in
 ## Setup
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+# Edit .env and add your API key
 ```
 
-Set at least one API key (or run Ollama locally) - see [Configuration](#configuration) below.
+A `.env.example` is included with all supported variables. Copy it to `.env` and fill in at least one API key (or run Ollama locally -- no key needed). See [Configuration](#configuration) for details on each variable.
 
 ## Sample output
 
@@ -116,15 +120,11 @@ python commit_critic.py --write
 python commit_critic.py --eval
 ```
 
-**Install git hooks:**
-```bash
-python commit_critic.py --install-hooks
-```
-
 ## Hook installation
 
 ```bash
-python commit_critic.py --install-hooks
+# Important: run with your venv Python so the hooks use the right interpreter
+.venv/bin/python commit_critic.py --install-hooks
 # Then just use git commit normally — suggestions appear automatically
 ```
 

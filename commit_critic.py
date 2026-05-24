@@ -1036,7 +1036,7 @@ def _install_hooks() -> None:
         console.print("[red]Not a git repository. Run from the repo root.[/red]")
         sys.exit(1)
 
-    python_exe = str(Path(sys.executable).resolve())
+    python_exe = str(Path(sys.executable))
     script_path = str(Path(__file__).resolve())
 
     hooks_dir = Path(".git/hooks")
