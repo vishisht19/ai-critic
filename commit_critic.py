@@ -125,25 +125,76 @@ class GitClient:
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 
-# Bump this to switch all prompts to a new version at once.
-_PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v2")
+_PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v1")
+
+_ANALYZE_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "index":      {"type": "integer"},
+            "score":      {"type": "integer", "minimum": 1, "maximum": 10},
+            "issue":      {"type": "string"},
+            "suggestion": {"type": "string"},
+            "category":   {"type": "string", "enum": ["vague", "wip", "good", "excellent"]},
+        },
+        "required": ["index", "score", "issue", "suggestion", "category"],
+    },
+}
+
+_JUDGE_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "index":       {"type": "integer"},
+            "judge_score": {"type": "integer", "minimum": 1, "maximum": 5},
+            "fair":        {"type": "boolean"},
+            "note":        {"type": "string"},
+        },
+        "required": ["index", "judge_score", "fair", "note"],
+    },
+}
 
 
 def _load_prompt(name: str, version: str | None = None) -> str:
-    """Load prompts/{version}/{name}.md — falls back to v1 .txt if .md missing."""
+    """Load prompts/{version}/{name}.md."""
     ver = version or _PROMPT_VERSION
-    md_path = _PROMPTS_DIR / ver / f"{name}.md"
-    if md_path.exists():
-        return md_path.read_text()
-    txt_path = _PROMPTS_DIR / ver / f"{name}.txt"
-    return txt_path.read_text()
+    return (_PROMPTS_DIR / ver / f"{name}.md").read_text()
 
 
 class LLMClient:
     """Provider-agnostic LLM adapter supporting Anthropic, OpenAI, and Ollama."""
 
+    _CACHE_FILE = Path(".commit_critic_cache.json")
+    _DEFAULT_TEMP = 0.4
+
     def __init__(self):
         self.provider, self.model = self._detect_provider()
+        self.temperature = self._load_calibrated_temperature()
+
+    def _load_calibrated_temperature(self) -> float:
+        if self._CACHE_FILE.exists():
+            try:
+                return json.loads(self._CACHE_FILE.read_text()).get("_meta", {}).get("calibrated_temperature", self._DEFAULT_TEMP)
+            except Exception:
+                pass
+        return self._DEFAULT_TEMP
+
+    @staticmethod
+    def _save_calibrated_temperature(temp: float) -> None:
+        cache_file = LLMClient._CACHE_FILE
+        cache: dict = {}
+        if cache_file.exists():
+            try:
+                cache = json.loads(cache_file.read_text())
+            except Exception:
+                pass
+        cache.setdefault("_meta", {})["calibrated_temperature"] = temp
+        try:
+            cache_file.write_text(json.dumps(cache, indent=2))
+        except Exception:
+            pass
 
     def _detect_provider(self) -> tuple[str, str]:
         """Auto-detect provider: LLM_PROVIDER env > ANTHROPIC_API_KEY > OPENAI_API_KEY > Ollama."""
@@ -210,7 +261,7 @@ class LLMClient:
             sys.exit(1)
         return _openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-    def _call_llm(self, system: str, user: str) -> str:
+    def _call_llm(self, system: str, user: str, json_schema: dict | None = None) -> str:
         if self.provider == "anthropic":
             client = self._get_anthropic_client()
             resp = client.messages.create(
@@ -236,20 +287,25 @@ class LLMClient:
         if self.provider == "ollama":
             import requests as _requests
             host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+            body: dict = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "stream": False,
+                "think": False,
+                "options": {"temperature": self.temperature},
+            }
+            if json_schema:
+                body["format"] = json_schema
             resp = _requests.post(
-                f"{host}/v1/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "stream": False,
-                },
-                timeout=120,
+                f"{host}/api/chat",
+                json=body,
+                timeout=300,
             )
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            return resp.json()["message"]["content"]
 
         raise ValueError(f"Unknown provider: {self.provider}")
 
@@ -258,15 +314,18 @@ class LLMClient:
         if not commits:
             return []
 
-        numbered = "\n".join(
-            f"{i+1}. {c['message']}" for i, c in enumerate(commits)
+        items = "\n".join(
+            f'  <commit index="{i+1}"><message>{c["message"][:500]}</message></commit>'
+            for i, c in enumerate(commits)
         )
+        xml_block = f"<commits>\n{items}\n</commits>"
 
         system = _load_prompt("analyze")
-        user = f"Review these {len(commits)} commit messages:\n\n{numbered}"
+        user = f"Review these {len(commits)} commit messages:\n\n{xml_block}"
 
         start = time.time()
-        raw = self._call_llm(system, user)
+        schema = _ANALYZE_SCHEMA if self.provider == "ollama" else None
+        raw = self._call_llm(system, user, json_schema=schema)
         latency_ms = int((time.time() - start) * 1000)
 
         parsed = self._parse_json_response(raw, len(commits))
@@ -289,6 +348,39 @@ class LLMClient:
                              sum(r.score for r in results) / len(results) if results else 0)
         return results
 
+    _VALID_CATEGORIES = {"vague", "wip", "good", "excellent"}
+
+    @staticmethod
+    def _sanitize_entry(entry: dict) -> dict:
+        """Clamp numeric fields and strip oversized strings to prevent injection bleed-through."""
+        score = entry.get("score", 5)
+        if not isinstance(score, int) or not (1 <= score <= 10):
+            score = 5
+
+        category = entry.get("category", "vague")
+        if category not in LLMClient._VALID_CATEGORIES:
+            category = "vague"
+
+        judge_score = entry.get("judge_score")
+        if judge_score is not None:
+            if not isinstance(judge_score, int) or not (1 <= judge_score <= 5):
+                judge_score = None
+
+        fair = entry.get("fair")
+        if not isinstance(fair, bool):
+            fair = None
+
+        return {
+            **entry,
+            "score": score,
+            "category": category,
+            "issue": str(entry.get("issue", ""))[:300],
+            "suggestion": str(entry.get("suggestion", ""))[:300],
+            "note": str(entry.get("note", ""))[:300],
+            "judge_score": judge_score,
+            "fair": fair,
+        }
+
     def _parse_json_response(self, raw: str, expected_count: int) -> list[dict]:
         """Parse LLM JSON output with four fallback strategies for malformed responses."""
         text = raw.strip()
@@ -297,7 +389,7 @@ class LLMClient:
         try:
             data = json.loads(text)
             if isinstance(data, list):
-                return data
+                return [self._sanitize_entry(e) for e in data]
         except json.JSONDecodeError:
             pass
 
@@ -306,7 +398,7 @@ class LLMClient:
         try:
             data = json.loads(text)
             if isinstance(data, list):
-                return data
+                return [self._sanitize_entry(e) for e in data]
         except json.JSONDecodeError:
             pass
 
@@ -316,7 +408,7 @@ class LLMClient:
             try:
                 data = json.loads(m.group(0))
                 if isinstance(data, list):
-                    return data
+                    return [self._sanitize_entry(e) for e in data]
             except json.JSONDecodeError:
                 pass
 
@@ -325,7 +417,7 @@ class LLMClient:
         results = []
         for obj in objects:
             try:
-                results.append(json.loads(obj))
+                results.append(self._sanitize_entry(json.loads(obj)))
             except json.JSONDecodeError:
                 pass
         if results:
@@ -424,20 +516,23 @@ class LLMClient:
                 sample.append(s)
         sample = sample[:5]
 
-        lines = []
+        items = []
         for i, s in enumerate(sample, 1):
-            lines.append(
-                f'{i}. Message: "{s.message}"\n'
-                f'   Assigned score: {s.score}/10\n'
-                f'   Category: {s.category}\n'
-                f'   Issue given: "{s.issue}"\n'
-                f'   Suggestion: "{s.suggestion}"'
+            items.append(
+                f'  <entry index="{i}">\n'
+                f'    <message>{s.message[:500]}</message>\n'
+                f'    <score>{s.score}</score>\n'
+                f'    <category>{s.category}</category>\n'
+                f'    <issue>{s.issue[:300]}</issue>\n'
+                f'    <suggestion>{s.suggestion[:300]}</suggestion>\n'
+                f'  </entry>'
             )
-        user = "\n\n".join(lines)
+        user = "<entries>\n" + "\n".join(items) + "\n</entries>"
 
         system = _load_prompt("judge")
 
-        raw = self._call_llm(system, user)
+        schema = _JUDGE_SCHEMA if self.provider == "ollama" else None
+        raw = self._call_llm(system, user, json_schema=schema)
         parsed = self._parse_json_response(raw, len(sample))
 
         hash_to_scored = {s.hash: s for s in scored}
@@ -768,8 +863,14 @@ class EvalRunner:
         mae = sum(r["abs_error"] for r in results) / len(results)
         category_accuracy = sum(1 for r in results if r["category_correct"])
 
+        # Calibrate temperature: generous model -> lower temp, strict -> higher
+        avg_bias = sum(r["score"] - (r["expected_min"] + r["expected_max"]) / 2 for r in results) / len(results)
+        calibrated_temp = round(max(0.0, min(0.8, LLMClient._DEFAULT_TEMP - avg_bias * 0.15)), 2)
+        if self.llm.provider == "ollama":
+            LLMClient._save_calibrated_temperature(calibrated_temp)
+
         Display.render_eval_results(results, within_range, mae, category_accuracy,
-                                    self.llm.provider, self.llm.model)
+                                    self.llm.provider, self.llm.model, calibrated_temp)
 
         entry = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -883,13 +984,16 @@ class Display:
 
     @staticmethod
     def render_eval_results(results, within_range, mae, category_accuracy,
-                             provider, model) -> None:
+                             provider, model, calibrated_temp: Optional[float] = None) -> None:
         total = len(results)
         console.print()
         console.print(Rule(f"[bold]EVAL RESULTS[/bold]  (provider: {provider}, model: {model})"))
         console.print(f"Within expected range:  [bold]{within_range}/{total}[/bold] ({round(within_range/total*100)}%)")
         console.print(f"Mean absolute error:    [bold]{round(mae, 2)}[/bold] points")
         console.print(f"Category accuracy:      [bold]{category_accuracy}/{total}[/bold] ({round(category_accuracy/total*100)}%)")
+
+        if calibrated_temp is not None and provider == "ollama":
+            console.print(f"Calibrated temperature: [bold]{calibrated_temp}[/bold] (saved for next run)")
 
         missed = [r for r in results if not r["in_range"]]
         if missed:
