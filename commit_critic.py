@@ -212,7 +212,7 @@ class LLMClient:
             return ("anthropic", "claude-haiku-4-5-20251001")
 
         if os.environ.get("OPENAI_API_KEY"):
-            return ("openai", "gpt-4o-mini")
+            return ("openai", "gpt-5.4-mini-2026-03-17")
 
         # Check Ollama
         ollama_result = self._check_ollama()
@@ -228,7 +228,7 @@ class LLMClient:
         if provider == "anthropic":
             return ("anthropic", "claude-haiku-4-5-20251001")
         if provider == "openai":
-            return ("openai", "gpt-4o-mini")
+            return ("openai", "gpt-5.4-mini-2026-03-17")
         if provider == "ollama":
             result = self._check_ollama()
             if result:
