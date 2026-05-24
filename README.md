@@ -4,6 +4,11 @@ An AI-powered CLI that reviews your git commit history and helps you write bette
 
 Works with Anthropic (Claude), OpenAI (GPT), or a local Ollama model. No lock-in.
 
+**Key features:**
+- LLM-as-a-judge validation to catch scoring bias
+- Automatic temperature calibration based on eval results (stored in cache, applied on next run)
+- Prompt injection guardrails: commit messages are XML-isolated and treated as plain text, with output schema validation so a malicious commit message cannot influence the scorer's behavior
+
 ## Setup
 
 ```bash
@@ -63,6 +68,19 @@ Provider is auto-detected in priority order: `LLM_PROVIDER` env var, then `ANTHR
 | `excellent` | 8-10 | Conventional commit with context and impact |
 
 Calibration anchors included in every prompt keep scores consistent across providers and runs (within ~1 point).
+
+## Temperature calibration
+
+After each `--eval` run the tool computes average scoring bias and saves a calibrated temperature to `.commit_critic_cache.json`. On the next run that temperature is loaded automatically, nudging the model toward the center of the expected ranges.
+
+The formula is `clamp(0.4 - avg_bias * 0.15, 0.0, 0.8)` - a gentle correction that doesn't over-steer. Only applies to Ollama (Anthropic and OpenAI use fixed temperature).
+
+## Prompt injection protection
+
+Commit messages are treated as untrusted data throughout the pipeline:
+
+1. **XML isolation** - each message is wrapped in `<message>` tags and the system prompt explicitly instructs the model to treat content inside those tags as plain text, not instructions
+2. **Output schema validation** - every response field is validated and sanitized: scores are clamped to 1-10, categories must be one of the four valid values, and text fields are truncated at 300 characters
 
 ## Usage
 
@@ -186,4 +204,4 @@ cat .commit_critic_metrics.jsonl | python -m json.tool
 pytest test_commit_critic.py -v
 ```
 
-The test suite covers: git log parsing, all four JSON fallback strategies, provider auto-detection, cache roundtrip, stats computation, commit partitioning, hook install/uninstall, and eval metrics. No LLM calls are made - all external dependencies are mocked.
+160 tests covering all CLI paths (`--analyze`, `--write`, `--eval`, `--install-hooks`, `--uninstall-hooks`), all three LLM providers, JSON schema enforcement, prompt injection sanitization, temperature calibration save/load, XML wrapping, hook deduplication, and remote URL cloning. No real LLM calls are made - all external dependencies are mocked.
